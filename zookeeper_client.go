@@ -53,77 +53,92 @@ func NewZooKeeperOffsetClient(app *ApplicationContext, cluster string) (*ZooKeep
 	return client, nil
 }
 
-
-func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForConsumer(consumer string, consumerPath string) {
-	children, _, err := zkOffsetClient.conn.Children(consumerPath + "/offsets")
+func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForConsumerGroup(consumerGroup string, consumerGroupPath string) {
+	topicsPath := consumerGroupPath + "/offsets"
+	topics, _, err := zkOffsetClient.conn.Children(topicsPath)
 	switch {
 	case err == nil:
-		for _, child := range children {
-			zkOffsetClient.getOffsetsForTopic(consumer, child, consumerPath + "/offsets" + "/" + child)
+		for _, topic := range topics {
+			zkOffsetClient.getOffsetsForTopic(consumerGroup, topic, topicsPath + "/" + topic)
 		}
 	case err ==  zk.ErrNoNode:
 		// it is OK as the offsets may not be managed by ZK
-		log.Infof("This consumer's offset is not managed by ZK: " + consumer)
-		return
+		log.Debugf("This consumer group's offset is not managed by ZK: " + consumerGroup)
 	default:
-		panic(err)
+		log.Warnf("Failed to read topics for consumer group %s in ZK path %s", consumerGroup, consumerGroupPath + "/offsets")
 	}
 }
 
-func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForTopic(consumer string, topic string, topicPath string) {
-	children, _, err := zkOffsetClient.conn.Children(topicPath)
+func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForTopic(consumerGroup string, topic string, topicPath string) {
+	partitions, _, err := zkOffsetClient.conn.Children(topicPath)
 	switch {
 	case err == nil:
-		for _, child := range children {
-			partition, _ := strconv.Atoi(child)
-			zkOffsetClient.getOffsetsForPartition(consumer, topic,  partition, topicPath + "/" + child)
+		for _, partitionStr := range partitions {
+			partition, errConversion := strconv.Atoi(partitionStr)
+			switch {
+			case errConversion == nil:
+				zkOffsetClient.getOffsetForPartition(consumerGroup, topic,  partition, topicPath + "/" + partitionStr)
+			default:
+				log.Errorf("Something is very wrong! The partition %s for topic %s in consumer group %s in ZK path %s should be a number",
+					partitionStr, topic, consumerGroup, topicPath)
+			}
 		}
 	default:
-		panic(err)
+		log.Warnf("Failed to read partitions for topic %s in consumer group %s in ZK path %s", topic, consumerGroup, topicPath)
 	}
 }
 
-func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetsForPartition(consumer string, topic string, partition int, partitionPath string) {
-
+func (zkOffsetClient *ZooKeeperOffsetClient) getOffsetForPartition(consumerGroup string, topic string, partition int, partitionPath string) {
 	zkNodeStat := &zk.Stat {}
 	offsetStr, zkNodeStat, err := zkOffsetClient.conn.Get(partitionPath)
 	switch {
 	case err == nil:
-		offset, _ := strconv.Atoi(string(offsetStr))
-		fmt.Printf("About to sync ZK based offset: [%s,%s,%v]::[%v,%v]\n", consumer, topic, partition, offset, zkNodeStat.Mtime)
-		partitionOffset := &PartitionOffset{
-			Cluster:   zkOffsetClient.cluster,
-			Topic:     topic,
-			Partition: int32(partition),
-			Group:     consumer,
-			Timestamp: int64(zkNodeStat.Mtime),
-			Offset:    int64(offset),
+		offset, errConversion := strconv.Atoi(string(offsetStr))
+		switch {
+		case errConversion == nil:
+			log.Debugf("About to sync ZK based offset: [%s,%s,%v]::[%v,%v]\n", consumerGroup, topic, partition, offset, zkNodeStat.Mtime)
+			partitionOffset := &PartitionOffset{
+				Cluster:   zkOffsetClient.cluster,
+				Topic:     topic,
+				Partition: int32(partition),
+				Group:     consumerGroup,
+				Timestamp: int64(zkNodeStat.Mtime), // note: this is millis
+				Offset:    int64(offset),
+			}
+			timeoutSendOffset(zkOffsetClient.app.Storage.offsetChannel, partitionOffset, 1)
+		default:
+			log.Errorf("Something is very wrong! The offset %s for partition %s for topic %s in consumer group %s in ZK path %s should be a number",
+				offsetStr, partition, topic, consumerGroup, partitionPath)
 		}
-		timeoutSendOffset(zkOffsetClient.app.Storage.offsetChannel, partitionOffset, 1)
 	default:
-		panic(err)
+		log.Warnf("Failed to read partition for partition %s of topic %s in consumer group %s in ZK path %s", partition, topic, consumerGroup, partitionPath)
 	}
 }
 
 func (zkOffsetClient *ZooKeeperOffsetClient) getOffsets(paths []string) {
 
+	log.Infof("Start to refresh ZK based offsets stored in paths: %s", paths)
+	// for now, we will perform the offset refreshing sequentially to keep it simple
 	for _, path := range paths {
+
+		// note: if a node does not exist, the "exists" flag will be set to false. The err, however, will be nil
 		exists, _, err := zkOffsetClient.conn.Exists(path)
 		switch {
 		case err == nil:
 			if !exists {
 				// we don't tolerate configuration error
+				log.Errorf("Invalid ZK offset path %s in configuration.", path)
 				panic(err)
 			}
 
-			children, _, err := zkOffsetClient.conn.Children(path)
+			consumerGroups, _, err := zkOffsetClient.conn.Children(path)
 			switch {
 			case err == nil:
-				for _, child := range children {
-					zkOffsetClient.getOffsetsForConsumer(child, path + "/"  + child)
+				for _, consumerGroup := range consumerGroups {
+					zkOffsetClient.getOffsetsForConsumerGroup(consumerGroup, path + "/" + consumerGroup)
 				}
 			default:
-				panic(err)
+				log.Warnf("Failed to read consumer groups in ZK path %s", path)
 			}
 
 		default:
