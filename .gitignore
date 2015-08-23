@@ -3,3 +3,4 @@ Burrow
 .*.swp
 !config
 .idea/
+log

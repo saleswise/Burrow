@@ -13,10 +13,10 @@ package main
 import (
 	"container/ring"
 	"encoding/json"
+	log "github.com/cihub/seelog"
 	"regexp"
 	"sync"
 	"time"
-  log "github.com/cihub/seelog"
 )
 
 type PartitionOffset struct {
@@ -64,9 +64,10 @@ const (
 	StatusError    StatusConstant = 3
 	StatusStop     StatusConstant = 4
 	StatusStall    StatusConstant = 5
+	StatusRewind   StatusConstant = 6
 )
 
-var StatusStrings = [...]string{"NOTFOUND", "OK", "WARN", "ERR", "STOP", "STALL"}
+var StatusStrings = [...]string{"NOTFOUND", "OK", "WARN", "ERR", "STOP", "STALL", "REWIND"}
 
 func (c StatusConstant) String() string {
 	if (c >= 0) && (c <= 5) {
@@ -130,6 +131,11 @@ type RequestConsumerStatus struct {
 	Cluster string
 	Group   string
 }
+type RequestConsumerDrop struct {
+	Result  chan StatusConstant
+	Cluster string
+	Group   string
+}
 
 func NewOffsetStorage(app *ApplicationContext) (*OffsetStorage, error) {
 	storage := &OffsetStorage{
@@ -180,6 +186,9 @@ func NewOffsetStorage(app *ApplicationContext) (*OffsetStorage, error) {
 				case *RequestConsumerStatus:
 					request, _ := r.(*RequestConsumerStatus)
 					go storage.evaluateGroup(request.Cluster, request.Group, request.Result)
+				case *RequestConsumerDrop:
+					request, _ := r.(*RequestConsumerDrop)
+					go storage.dropGroup(request.Cluster, request.Group, request.Result)
 				default:
 					// Silently drop unknown requests
 				}
@@ -235,7 +244,7 @@ func (storage *OffsetStorage) addConsumerOffset(offset *PartitionOffset) {
 
 	// Get broker partition count and offset for this topic and partition first
 	storage.offsets[offset.Cluster].brokerLock.RLock()
-	if topic, ok := storage.offsets[offset.Cluster].broker[offset.Topic]; (!ok) || (int32(len(topic)) <= offset.Partition) || (topic[offset.Partition] == nil) {
+	if topic, ok := storage.offsets[offset.Cluster].broker[offset.Topic]; !ok || (ok && ((int32(len(topic)) <= offset.Partition) || (topic[offset.Partition] == nil))) {
 		// If we don't have the partition or offset from the broker side yet, ignore the consumer offset for now
 		storage.offsets[offset.Cluster].brokerLock.RUnlock()
 		return
@@ -293,6 +302,20 @@ func (storage *OffsetStorage) Stop() {
 	close(storage.quit)
 }
 
+func (storage *OffsetStorage) dropGroup(cluster string, group string, resultChannel chan StatusConstant) {
+	storage.offsets[cluster].consumerLock.Lock()
+
+	if _, ok := storage.offsets[cluster].consumer[group]; ok {
+		log.Infof("Removing group %s from cluster %s by request", group, cluster)
+		delete(storage.offsets[cluster].consumer, group)
+		resultChannel <- StatusOK
+	} else {
+		resultChannel <- StatusNotFound
+	}
+
+	storage.offsets[cluster].consumerLock.Unlock()
+}
+
 // Evaluate a consumer group based on specific rules about lag
 // Rule 1: If over the stored period, the lag is ever zero for the partition, the period is OK
 // Rule 2: If the consumer offset does not change, and the lag is non-zero, it's an error (partition is stalled)
@@ -300,6 +323,7 @@ func (storage *OffsetStorage) Stop() {
 // Rule 4: If the difference between now and the last offset timestamp is greater than the difference between the last and first offset timestamps, the
 //         consumer has stopped committing offsets for that partition (error)
 // Rule 5: If the lag is -1, this is a special value that means there is no broker offset yet. Consider it good (will get caught in the next refresh of topics)
+// Rule 6: If the consumer offset decreases from one interval to the next the partition is marked as a rewind (error)
 func (storage *OffsetStorage) evaluateGroup(cluster string, group string, resultChannel chan *ConsumerGroupStatus) {
 	status := &ConsumerGroupStatus{
 		Cluster:    cluster,
@@ -320,7 +344,7 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 	// Scan the offsets table once and store all the offsets for the group locally
 	status.Status = StatusOK
 	offsetList := make(map[string][][]ConsumerOffset, len(storage.offsets[cluster].consumer[group]))
-  var youngestOffset int64
+	var youngestOffset int64
 	for topic, partitions := range storage.offsets[cluster].consumer[group] {
 		offsetList[topic] = make([][]ConsumerOffset, len(partitions))
 		for partition, offsetRing := range partitions {
@@ -338,27 +362,27 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 				ptr, _ := val.(*ConsumerOffset)
 				offsetList[topic][partition][idx] = *ptr
 
-        // Track the youngest offset we have found to check expiration
-        if offsetList[topic][partition][idx].Timestamp > youngestOffset {
-          youngestOffset = offsetList[topic][partition][idx].Timestamp
-        }
+				// Track the youngest offset we have found to check expiration
+				if offsetList[topic][partition][idx].Timestamp > youngestOffset {
+					youngestOffset = offsetList[topic][partition][idx].Timestamp
+				}
 			})
 		}
 	}
 	storage.offsets[cluster].consumerLock.RUnlock()
 
-  // If the youngest offset is older than our expiration window, flush the group
-  if (youngestOffset > 0) && (youngestOffset < ((time.Now().Unix() - storage.app.Config.Lagcheck.ExpireGroup) * 1000)) {
-    storage.offsets[cluster].consumerLock.Lock()
-    log.Infof("Removing expired group %s from cluster %s", group, cluster)
-    delete(storage.offsets[cluster].consumer, group)
-    storage.offsets[cluster].consumerLock.Unlock()
+	// If the youngest offset is older than our expiration window, flush the group
+	if (youngestOffset > 0) && (youngestOffset < ((time.Now().Unix() - storage.app.Config.Lagcheck.ExpireGroup) * 1000)) {
+		storage.offsets[cluster].consumerLock.Lock()
+		log.Infof("Removing expired group %s from cluster %s", group, cluster)
+		delete(storage.offsets[cluster].consumer, group)
+		storage.offsets[cluster].consumerLock.Unlock()
 
-    // Return the group as a 404
-	  status.Status = StatusNotFound
+		// Return the group as a 404
+		status.Status = StatusNotFound
 		resultChannel <- status
 		return
-  }
+	}
 
 	for topic, partitions := range offsetList {
 		for partition, offsets := range partitions {
@@ -368,13 +392,13 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 			}
 			maxidx := len(offsets) - 1
 
-			// Rule 5
+			// Rule 5 - we're missing broker offsets so we're not complete yet
 			if offsets[0].Lag == -1 {
 				status.Complete = false
 				continue
 			}
 
-			// Rule 4
+			// Rule 4 - Offsets haven't been committed in a while
 			if ((time.Now().Unix() * 1000) - offsets[maxidx].Timestamp) > (offsets[maxidx].Timestamp - offsets[0].Timestamp) {
 				status.Status = StatusError
 				status.Partitions = append(status.Partitions, &PartitionStatus{
@@ -385,6 +409,22 @@ func (storage *OffsetStorage) evaluateGroup(cluster string, group string, result
 					End:       offsets[maxidx],
 				})
 				continue
+			}
+
+			// Rule 6 - Did the consumer offsets rewind at any point?
+			// We check this first because we always want to know about a rewind - it's bad behavior
+			for i := 1; i <= maxidx; i++ {
+				if offsets[i].Offset < offsets[i-1].Offset {
+					status.Status = StatusError
+					status.Partitions = append(status.Partitions, &PartitionStatus{
+						Topic:     topic,
+						Partition: int32(partition),
+						Status:    StatusRewind,
+						Start:     offsets[0],
+						End:       offsets[maxidx],
+					})
+					continue
+				}
 			}
 
 			// Rule 1
